@@ -1,0 +1,19 @@
+[project]
+name = "nnscope"
+version = "0.1.0"
+description = "Collapsible HTML trees and hook-execution tracing for torch.nn.Module."
+readme = "README.md"
+authors = [
+    { name = "Jeffrey Ke", email = "jeffke613@gmail.com" }
+]
+requires-python = ">=3.11"
+# Deliberately unpinned and without an index source: nnscope is consumed as an
+# editable path dep by projects on different torch builds (segmentation: 2.11
+# cu128; others: 2.7); the consumer's env supplies torch.
+dependencies = [
+    "torch",
+]
+
+[build-system]
+requires = ["uv_build>=0.11.6,<0.12.0"]
+build-backend = "uv_build"
