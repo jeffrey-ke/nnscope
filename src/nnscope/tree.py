@@ -11,6 +11,8 @@ from dataclasses import dataclass, field
 
 import torch.nn as nn
 
+from nnscope.grad import GradReport, GradState
+
 
 @dataclass
 class ModuleNode:
@@ -23,6 +25,7 @@ class ModuleNode:
     total_params: int    # cumulative, including children (post-order rollup)
     total_trainable: int
     children: list["ModuleNode"] = field(default_factory=list)
+    grad_state: GradState | None = None  # observed (apply_grad_report); None = not probed
 
 
 def build_tree(model: nn.Module) -> ModuleNode:
@@ -74,3 +77,20 @@ def iter_nodes(root: ModuleNode) -> Iterator[ModuleNode]:
     yield root
     for child in root.children:
         yield from iter_nodes(child)
+
+
+def apply_grad_report(root: ModuleNode, report: GradReport) -> None:
+    """Stamp each node's ``grad_state`` from ``report.modules[node.path]`` (in place).
+
+    The dynamic overlay's join step: build the tree once (:func:`build_tree`, a pure
+    structural capture), probe once (:func:`nnscope.grad.probe_gradients`), then
+    annotate here. Nodes with no trainable params and no frozen leak stay ``None``
+    (the renderer shows no observed glyph); a node whose subtree contains a
+    frozen-leak param is stamped ``"frozen-leak"`` (it propagates to the root)."""
+    for node in iter_nodes(root):
+        mg = report.modules.get(node.path)
+        if mg is None:
+            continue
+        if mg.n_params == 0 and mg.state != "frozen-leak":
+            continue  # frozen / param-less container — no observed signal to show
+        node.grad_state = mg.state

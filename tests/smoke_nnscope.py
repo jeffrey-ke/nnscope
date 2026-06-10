@@ -10,12 +10,16 @@ import doctest
 import torch
 import torch.nn as nn
 
+import nnscope.grad
 import nnscope.trace
 from nnscope import (
+    apply_grad_report,
     assert_gligen_pairing,
     build_tree,
     iter_nodes,
+    probe_gradients,
     render_html,
+    static_grad_audit,
     trace_forward,
 )
 
@@ -118,16 +122,115 @@ def test_trace():
     print("trace: OK (golden order, PASS on correct pairing, FAIL on swapped)")
 
 
+# ---------------------------------------------------------------- grad.py
+class GradToy(nn.Module):
+    """One module per gradient fate, all forced without CUDA:
+
+      frozen        used, requires_grad_(False)        -> no grad (not a leak)
+      healthy       used, trainable                    -> "flowed"
+      disconnected  trainable but NEVER used           -> "none"
+      gate          nn.Parameter(0.) in tanh(gate)*..  -> "flowed" (sech^2(0)=1)
+      gated         used but scaled by tanh(0)=0       -> "zero"  (the GLIGEN gate)
+    """
+
+    def __init__(self):
+        super().__init__()
+        self.frozen = nn.Linear(4, 4)
+        self.frozen.requires_grad_(False)
+        self.healthy = nn.Linear(4, 4)
+        self.disconnected = nn.Linear(4, 4)
+        self.gate = nn.Parameter(torch.zeros(()))
+        self.gated = nn.Linear(4, 4)
+
+    def forward(self, x):
+        return self.frozen(x) + self.healthy(x) + torch.tanh(self.gate) * self.gated(x)
+
+
+def test_grad_probe():
+    m = GradToy()
+    r = probe_gradients(m, lambda: m(torch.randn(2, 4)), seed=0)
+    st = {p.path: p.state for p in r.params}
+    assert st["healthy.weight"] == "flowed" and st["healthy.bias"] == "flowed"
+    assert st["disconnected.weight"] == "none" and st["disconnected.bias"] == "none"
+    assert st["gate"] == "flowed", "the gate param itself must receive signal"
+    assert st["gated.weight"] == "zero" and st["gated.bias"] == "zero"
+    assert "frozen.weight" not in st and not r.frozen_leaks, "frozen leaked into the report"
+
+    assert r.modules["healthy"].state == "flowed"
+    dc = r.modules["disconnected"]
+    assert dc.state == "none" and not dc.received_signal
+    gated = r.modules["gated"]
+    assert gated.state == "zero" and not gated.received_signal, \
+        "closed gate => present-but-zero grad, no signal"
+    assert r.modules[""].state == "mixed"
+    # gate-immune wiring witness: the model as a whole got signal despite the closed gate
+    assert r.subtree_received_signal() and r.subtree_received_signal("")
+
+    # negative: a fully-detached output has nothing to probe -> fail loud
+    detached = nn.Linear(4, 4)
+    try:
+        probe_gradients(detached, lambda: detached(torch.randn(2, 4)).detach())
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("probe must raise on a detached (no-grad) output")
+    print("grad probe: OK (flowed/zero/none/gate + detached-raises)")
+
+
+def test_static_audit():
+    m = GradToy()
+    opt = torch.optim.SGD([p for p in m.parameters() if p.requires_grad], lr=0.1)
+    a = static_grad_audit(m, opt)
+    assert a.ok and a.has_optimizer
+    assert not a.missing_from_optimizer and not a.extra_in_optimizer
+
+    # freeze a module AFTER the optimizer captured it — the classic silent bug
+    m.healthy.requires_grad_(False)
+    b = static_grad_audit(m, opt)
+    assert not b.ok, "freeze-after-construction must FAIL the audit"
+    assert any("healthy" in n for n in b.extra_in_optimizer), b.summary()
+
+    # no optimizer => requires_grad partition only; identity not checked, ok True
+    c = static_grad_audit(m)
+    assert c.ok and not c.has_optimizer
+    print("static audit: OK (matches, catches freeze-after-construction, partition-only)")
+
+
+def test_grad_overlay_html():
+    m = GradToy()
+    r = probe_gradients(m, lambda: m(torch.randn(2, 4)), seed=0)
+    root = build_tree(m)
+    apply_grad_report(root, r)
+    page = render_html(root, title="grad")
+    assert "✅" in page, "flowed glyph missing"
+    assert "⚠" in page, "zero (gated) glyph missing"
+    assert "\U0001f480" in page, "none (disconnected) glyph missing"
+    assert 'class="legend"' in page, "legend missing when states present"
+
+    # back-compat: a fresh (un-stamped) tree with no grad_states renders no overlay
+    plain = render_html(build_tree(m))
+    assert "✅" not in plain and "\U0001f480" not in plain, "observed glyph leaked into plain render"
+    assert 'class="legend"' not in plain, "legend must be omitted without states"
+    print(f"grad overlay html: OK ({len(page)} bytes)")
+
+
 def test_doctests():
-    results = doctest.testmod(nnscope.trace, verbose=False)
-    assert results.attempted > 0 and results.failed == 0, \
-        f"doctests: {results.failed} failures / {results.attempted} attempted"
-    print(f"doctests: OK ({results.attempted} examples)")
+    attempted = failed = 0
+    for mod in (nnscope.trace, nnscope.grad):
+        results = doctest.testmod(mod, verbose=False)
+        attempted += results.attempted
+        failed += results.failed
+    assert attempted > 0 and failed == 0, \
+        f"doctests: {failed} failures / {attempted} attempted"
+    print(f"doctests: OK ({attempted} examples)")
 
 
 if __name__ == "__main__":
     test_tree()
     test_html()
     test_trace()
+    test_grad_probe()
+    test_static_audit()
+    test_grad_overlay_html()
     test_doctests()
     print("smoke_nnscope: ALL OK")
